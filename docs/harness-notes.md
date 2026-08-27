@@ -134,3 +134,110 @@ recorded at the registration site so nobody "tidies" the names back.
    collision is known at load time.
 2. Include TUI built-ins in `get_available_commands` with their real precedence, so introspection matches
    dispatch and a shadowing test can actually fail.
+
+---
+
+## 6. Extensions cannot reach the native peer bus, and a tool call cannot leave the turn
+
+**Symptom.** omp ships agent-to-agent messaging: `hub` (the former `irc` tool) over a process-global
+`IrcBus`, routed through a process-global `AgentRegistry`. An extension that wants its own
+participants on that bus — a debate whose seats are real agents that could hold tools and be
+addressed by name from Agent Hub — has no documented way in. `ExtensionContext` offers `ui`, `mode`,
+`hasUI`, `cwd`, `sessionManager`, `modelRegistry`, `model`, `models`, `isIdle`, `abort`, `compact`,
+timers, `invokeTool`, `memory`, and the two usage snapshots. No registry, no bus, no spawn.
+
+The second half compounds it. `ToolDefinition` has no async/background mode, so a tool call runs
+inside the session's turn and blocks it. A `hub` message addressed to `Main` is therefore delivered
+only "at the next step boundary" — i.e. **after** the tool returns. So even with bus access, a
+tool-scoped run could not exchange messages with the user while it ran.
+
+**Evidence.** `extensibility/extensions/types.d.ts`, `ExtensionContext` (`:297-381`) and
+`ToolDefinition` (`:444-484`) — neither carries an agent, registry, messaging or async field. The
+only route is importing internals from the package root: `runSubprocess` and `AgentRegistry`
+(`sdk.d.ts:298`, `task/executor.d.ts`), whose `ExecutorOptions` is a ~50-field contract documented
+for standalone embedders, not for in-process extensions. Delivery semantics are in
+`session/irc-bridge.ts` (`deliver()`): parent→child becomes `agent.steer()` drained at a later step
+boundary, sibling→sibling becomes a non-interrupting aside, and nothing interrupts a turn in flight.
+
+**Workaround in this repo.** The seats stay stateless `streamSimple()` completions, and the user
+participates through `ctx.ui` dialogs at round boundaries (`makeGateRunner` in `index.ts`). That is
+not a workaround for a missing feature so much as evidence the feature would not have helped: the
+blocking-turn constraint rules the bus out for this shape of tool regardless.
+
+**Proposed fix.** Two independent additions. (1) A narrow extension-facing seam for named
+participants — spawn a subagent, address it, await its reply — rather than exposing the executor's
+internal option bag. (2) An opt-in async tool mode, so a long-running tool can leave the turn and
+therefore become reachable over the bus at all.
+
+---
+
+## 7. A timed-out ask dialog answers itself with the recommended option
+
+**Symptom.** `ExtensionUIDialogOptions.timeout` reads like "give up after N seconds". It is not:
+the implementation fills every unanswered question with its `recommended` option and submits with
+`timedOut: true`. An extension that treats a timeout as cancellation — as this one did, with a
+comment saying `undefined` = cancelled or timed out — silently runs whatever it happened to
+recommend. Here that meant an unattended pre-flight dialog could start a **maximum-effort** debate
+while the README promised cheap defaults on timeout.
+
+**Evidence.** `modes/components/ask-dialog.ts`, `#handleTimeout`: for each unanswered question it
+resolves a `fallbackIndex` from `question.recommended`, adds that label to `selectedOptions`, sets
+`state.timedOut = true`, and submits. Nothing in `ExtensionUIDialogOptions` documents this.
+
+**Workaround in this repo.** `resolvePreflight` and the gate runner both check
+`results.some(r => r.timedOut)` and treat it as a cancel, restoring the documented behaviour.
+
+**Proposed fix.** Document the auto-submit on the `timeout` field, or add an explicit
+`timeoutBehaviour: "submit" | "cancel"` so the caller states which it wants.
+
+---
+
+## 8. `ctx.ui.editor` silently ignores `timeout`
+
+**Symptom.** `select`, `confirm` and `input` all honour `ExtensionUIDialogOptions.timeout`. The
+multi-line `editor` accepts the same options object and drops it: only submit, Esc, or an aborted
+signal ever closes it. An extension that relies on a timeout to keep an unattended surface moving
+gets an unbounded wait instead, with nothing at the type level to warn it.
+
+**Evidence.** `modes/controllers/extension-ui-controller.ts`: `showHookInput` and
+`showHookSelector` pass `timeout`/`onTimeout` into their components; `showHookEditor` constructs
+`HookEditorComponent` with title, prefill, submit and cancel callbacks plus `editorOptions`, and
+never forwards `dialogOptions.timeout`.
+
+**Workaround in this repo.** The gate flow puts its timeout on the menu dialog, which does honour
+it, and treats the editor as unbounded on purpose — a half-typed challenge should not vanish on a
+clock. The reason is recorded at the call site so nobody "fixes" it by adding a `timeout` that does
+nothing.
+
+**Proposed fix.** Wire `timeout`/`onTimeout` through `showHookEditor`, or mark them unsupported for
+`editor` in the type.
+
+---
+
+## 9. `ExtensionUIDialogOptions.timeout` is milliseconds, and nothing says so
+
+**Symptom.** The field is documented as "UI dialog options for extensions" with `timeout?: number` and
+no unit. It is milliseconds. This extension passed seconds for its entire existence
+(`PREFLIGHT_TIMEOUT_S = 120`), so every pre-flight dialog expired after **120 ms** — before a human
+could read it, let alone answer. Combined with item 7 (a timed-out dialog submits its `recommended`
+option rather than cancelling), the advertised "the tool asks you how many agents should debate"
+silently answered itself with the recommended option on every run. The README documented behaviour
+the code could not deliver, and no test could see it: the RPC smoke tier has no UI, so the dialog
+path never executes there.
+
+**Evidence.** `modes/components/ask-dialog.ts:424-433` passes `options.timeout` straight into
+`new CountdownTimer(timeoutMs, …)`, and `modes/components/countdown-timer.ts:13-21` names the
+parameter `timeoutMs`, uses it as `setTimeout(…, this.#initialMs)`, and renders
+`Math.ceil(timeoutMs / 1000)` as the countdown. `extensibility/extensions/types.d.ts` documents
+neither the unit nor the auto-submit.
+
+**How it surfaced.** A live TUI run of the interactive gates: both gates reported
+`gate timed out; the debate continued` within seconds of opening, and the dialog frame rendered
+`╭─ Ask (1s) ─` — a one-second countdown for what was meant to be five minutes.
+
+**Workaround in this repo.** Every dialog budget is now named `*_MS` and passed in milliseconds,
+with the unit and its history recorded at the constant.
+
+**Proposed fix.** Rename the field `timeoutMs`, or document the unit on it. A dialog budget is
+exactly the kind of value where a silent unit mismatch produces plausible-looking behaviour instead
+of an error.
