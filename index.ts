@@ -13,6 +13,7 @@ import type { Api, Model, TextContent } from "@oh-my-pi/pi-ai";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type {
 	ExtensionAPI,
+	ExtensionAskDialogOption,
 	ExtensionAskDialogQuestion,
 	ExtensionContext,
 } from "@oh-my-pi/pi-coding-agent";
@@ -23,12 +24,17 @@ import {
 	type DebateOutcome,
 	type DebateParams,
 	type DebateView,
+	type GateAnswer,
+	type GateIO,
+	type GateRunner,
 	type Summarizer,
 	type TurnRunner,
 	type Ultrathink,
+	neededFiles,
 	pickModel,
 	readFiles,
 	runDebate,
+	runGateDialogs,
 	seatingFor,
 } from "./core.js";
 import { type RenderHelpers, renderDebate } from "./render.js";
@@ -148,9 +154,8 @@ export function makeTurnRunner(ctx: ExtensionContext, model: Model<Api>): TurnRu
 
 /** `ExtensionUIDialogOptions.timeout` is MILLISECONDS, though nothing in its type
  *  says so (`CountdownTimer(timeoutMs)` in ask-dialog.ts). Passing seconds here
- *  made every pre-flight dialog expire after 120 ms — before a human could read
- *  it — and then answer itself with its recommended option, so "the tool asks you"
- *  was never true. See docs/harness-notes.md items 7 and 9. */
+ *  made every pre-flight dialog self-answer with its recommended option in a
+ *  tenth of a second — see docs/harness-notes.md item 9. */
 const PREFLIGHT_TIMEOUT_MS = 120_000;
 const CUSTOM_COUNT_TIMEOUT_MS = 60_000;
 
@@ -168,6 +173,13 @@ const ULTRA_OPTIONS = [
 	{ label: "All agents", description: "Every seat at maximum effort. Slowest and most expensive." },
 	{ label: "No ultrathink", description: "Provider defaults for every seat." },
 ];
+const INTERACTIVE_OPTIONS = [
+	{ label: "No — run it start to finish", description: "The debate never stops to ask." },
+	{
+		label: "Yes — stop after each round for my questions (experimental)",
+		description: "You may question or challenge any agent; each answer costs one model call.",
+	},
+];
 const ULTRA_BY_LABEL: Record<string, Ultrathink> = {
 	"Adjudicator only": "adjudicator",
 	"All agents": "all",
@@ -177,6 +189,8 @@ const ULTRA_BY_LABEL: Record<string, Ultrathink> = {
 interface Preflight {
 	debaters: number;
 	ultrathink: Ultrathink;
+	/** Whether to pause at round boundaries for the user's questions. */
+	interactive: boolean;
 	/** True when the user answered the dialog, so the notes can say so. */
 	asked: boolean;
 }
@@ -196,13 +210,15 @@ async function resolvePreflight(
 ): Promise<Preflight> {
 	const haveDebaters = typeof params.debaters === "number";
 	const haveUltra = typeof params.ultrathink === "string";
+	const haveInteractive = typeof params.interactive === "boolean";
 	const fallback: Preflight = {
 		debaters: params.debaters ?? MIN_DEBATERS,
 		ultrathink: params.ultrathink ?? "none",
+		interactive: params.interactive ?? false,
 		asked: false,
 	};
 	// Never block an unattended run (print/RPC/ACP) on a dialog nobody can answer.
-	if ((haveDebaters && haveUltra) || !ctx.hasUI || !ctx.ui.askDialog) return fallback;
+	if ((haveDebaters && haveUltra && haveInteractive) || !ctx.hasUI || !ctx.ui.askDialog) return fallback;
 
 	const questions: ExtensionAskDialogQuestion[] = [];
 	if (!haveDebaters)
@@ -221,14 +237,25 @@ async function resolvePreflight(
 			options: ULTRA_OPTIONS,
 			recommended: 0,
 		});
+	if (!haveInteractive)
+		questions.push({
+			id: "interactive",
+			header: "Your turn",
+			question:
+				"Join the debate? You would be asked after every round, and after the verdict, whether to " +
+				"question or challenge any agent.",
+			options: INTERACTIVE_OPTIONS,
+			recommended: 0,
+		});
 
 	const answer = await ctx.ui.askDialog(questions, { signal, timeout: PREFLIGHT_TIMEOUT_MS });
-	// `undefined` = cancelled; `kind: "chat"` = user redirected to chat.
+	// `undefined` = cancelled; `kind: "chat"` = the user redirected to chat.
 	if (!answer || answer.kind !== "submit") return fallback;
 	// A timeout does NOT resolve `undefined`: the host fills every unanswered
 	// question with its `recommended` option and submits with `timedOut: true`
-	// (`ask-dialog.ts`, `#handleTimeout`). Treat it as a cancel so the documented
-	// contract — a timeout runs the cheap defaults — is actually honoured.
+	// (`ask-dialog.ts`, `#handleTimeout`). Without this an unattended dialog would
+	// silently start a max-effort debate, contradicting the documented contract
+	// that a timeout runs the cheap defaults.
 	if (answer.results.some((r) => r.timedOut)) return fallback;
 
 	const out: Preflight = { ...fallback, asked: true };
@@ -236,6 +263,10 @@ async function resolvePreflight(
 		const picked = item.selectedOptions[0] ?? item.customInput ?? "";
 		if (item.id === "ultrathink") {
 			out.ultrathink = ULTRA_BY_LABEL[picked] ?? "none";
+			continue;
+		}
+		if (item.id === "interactive") {
+			out.interactive = picked.startsWith("Yes");
 			continue;
 		}
 		if (item.id !== "debaters") continue;
@@ -253,6 +284,64 @@ async function resolvePreflight(
 	return out;
 }
 
+/** Dialog budget at a gate, in milliseconds (see PREFLIGHT_TIMEOUT_MS). Generous,
+ *  because the user is being asked to think — bounded, because the debate holds
+ *  the session's turn open while it waits. */
+const GATE_TIMEOUT_MS = 300_000;
+
+/**
+ * The interactive gate: supplies the two host calls `runGateDialogs` needs and
+ * nothing else. All sequencing, copy and target resolution live in `core.ts`,
+ * where they run — and are asserted — under plain `bun`.
+ *
+ * `undefined` when there is no interactive surface. That is the single switch the
+ * whole feature hangs off: `runDebate` skips every gate when the runner is
+ * absent, so an unattended run cannot stall on a dialog nobody can see.
+ */
+export function makeGateRunner(
+	ctx: ExtensionContext,
+	ultrathink: Ultrathink,
+	signal?: AbortSignal,
+): GateRunner | undefined {
+	if (!ctx.hasUI || !ctx.ui.askDialog) return undefined;
+	const askDialog = ctx.ui.askDialog.bind(ctx.ui);
+	const io: GateIO = {
+		ask: (q) =>
+			askDialog(
+				[
+					{
+						id: q.id,
+						header: q.header,
+						question: q.question,
+						options: q.options as ExtensionAskDialogOption[],
+						...(q.multi === undefined ? {} : { multi: q.multi }),
+						...(q.recommended === undefined ? {} : { recommended: q.recommended }),
+					},
+				],
+				{ signal, timeout: GATE_TIMEOUT_MS },
+			) as Promise<GateAnswer>,
+		edit: (title) =>
+			ctx.ui.editor(
+				title,
+				"",
+				{
+					// No `timeout`: the host never wires one into the editor
+					// (`extension-ui-controller.ts`, showHookEditor), and a half-typed
+					// challenge should not vanish on a clock anyway.
+					signal,
+				},
+				// Enter submits, Shift+Enter inserts a newline. The default (hook-style)
+				// chord is Ctrl+Q / Ctrl+Enter, which is the wrong bet for a paid action:
+				// driving a real TUI, a raw Ctrl+Q never reached the editor, and the
+				// host's own source notes some terminals cannot deliver a distinct
+				// Ctrl+Enter at all. Prompt-style also matches the ask dialog's own
+				// free-text overlay, so the whole gate flow submits on one key.
+				{ promptStyle: true },
+			),
+	};
+	return (info) => runGateDialogs(info, io, ultrathink, signal);
+}
+
 /** Repaint cadence for the thinking animation. The host only advances
  *  `spinnerFrame` when a tool emits an update, so without a heartbeat the dots
  *  freeze exactly when a model is thinking hardest and streaming nothing. */
@@ -267,11 +356,13 @@ export default function debateExtension(pi: ExtensionAPI): void {
 		description:
 			"Convene multiple models (default three) in a proposer/critic/adjudicator debate over a plan " +
 			"or an implementation review, and return the adjudicated plan. Expensive: rounds × debaters + 1 " +
-			"model calls with long messages. When `debaters`/`ultrathink` are omitted and a TUI is present, " +
-			"the tool asks the user directly before starting — only pass them when the user already specified.",
+			"model calls with long messages, plus one per agent the user addresses at an interactive gate. " +
+			"When `debaters`/`ultrathink`/`interactive` are omitted and a TUI " +
+			"is present, the tool asks the user directly before starting — only pass them when the user " +
+			"already specified.",
 		// Deliberately NOT "read": this can spend rounds × debaters + 1 max-effort
-		// calls, so it belongs behind the same gate as other consequential operations.
-		approval: "exec",
+		// calls, plus one per agent addressed at a gate, so it belongs behind the
+		// same gate as other consequential operations.
 		// Top-level rather than the extension default of "discoverable":
 		// /plan-debate and /review-debate instruct the orchestrator to call this by
 		// name, so it must always be in the active set.
@@ -309,13 +400,21 @@ export default function debateExtension(pi: ExtensionAPI): void {
 				.describe(
 					"Force maximum reasoning effort for the named agents. Omit to let the tool ask the user.",
 				),
+			interactive: z
+				.boolean()
+				.optional()
+				.describe(
+					"Pause after every round, and after the verdict, so the user can question or challenge " +
+						"individual agents. Omit to let the tool ask the user.",
+				),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const p = params as DebateParams;
-			const { debaters, ultrathink, asked } = await resolvePreflight(p, ctx, signal);
+			const { debaters, ultrathink, interactive, asked } = await resolvePreflight(p, ctx, signal);
 			const model = pickModel(ctx);
 			const fileText = await readFiles(p.files);
 			const summarize = makeSummarizer(ctx, signal);
+			const gate = interactive ? makeGateRunner(ctx, ultrathink, signal) : undefined;
 
 			let latest: { view: DebateView; transcript: string } | undefined;
 			let dirty = false;
@@ -328,7 +427,11 @@ export default function debateExtension(pi: ExtensionAPI): void {
 					content: [{ type: "text", text: latest.transcript }],
 					// `details` carries the view the renderer paints; shallow-copied so a
 					// host that reference-compares sees a changed object each repaint.
-					details: { ...latest.view, current: latest.view.current && { ...latest.view.current } },
+					details: {
+						...latest.view,
+						current: latest.view.current && { ...latest.view.current },
+						gate: latest.view.gate && { ...latest.view.gate },
+					},
 				});
 			};
 			const timer = ctx.setInterval(() => {
@@ -342,11 +445,14 @@ export default function debateExtension(pi: ExtensionAPI): void {
 					{
 						runTurn: makeTurnRunner(ctx, model),
 						summarize,
+						gate,
 						onUpdate: (view, transcript) => {
 							// Turn boundaries paint immediately; per-token chunks only mark
 							// the view dirty so the heartbeat coalesces them — re-sending the
-							// whole transcript per token is O(n²) bytes over RPC.
-							const key = `${view.current?.label ?? ""}|${view.turns.length}|${view.aborted}|${view.error ?? ""}`;
+							// whole transcript per token is O(n²) bytes over RPC. A gate
+							// opening or closing paints at once too: nothing is streaming
+							// then, so the heartbeat would not repaint it on its own.
+							const key = `${view.current?.label ?? ""}|${view.turns.length}|${view.aborted}|${view.error ?? ""}|${view.gate?.kind ?? ""}${view.gate?.round ?? ""}`;
 							latest = { view, transcript };
 							if (key !== prevKey) {
 								prevKey = key;
@@ -370,12 +476,30 @@ export default function debateExtension(pi: ExtensionAPI): void {
 				`Debaters: ${seating.proposers} proposer(s) + ${seating.critics} critic(s); ` +
 					`ultrathink: ${ultrathink}${asked ? " (chosen interactively)" : ""}.`,
 			);
+			notes.push(...out.notes);
+			const interjections = out.turns.filter((t) => t.role === "user").length;
+			if (interjections)
+				notes.push(`You interjected ${interjections} time(s); your turns are in the transcript above.`);
+			if (interactive && !gate)
+				notes.push(
+					"Interactive gates were requested, but this run has no TUI to ask through; the debate ran " +
+						"straight through.",
+				);
 			if (!summarize) notes.push("No cheap model resolved for summaries; bubbles show head lines.");
-			if (p.mode === "review")
+			if (p.mode === "review") {
 				notes.push(
 					"Review performed by toolless models over the supplied briefing only. They could not " +
 						"read the codebase; findings AND omissions are bounded by what was pasted in.",
 				);
+				// Turns the toolless-review gap from silent into actionable: the critics
+				// name what they were not shown, so the caller can re-run with it.
+				const missing = neededFiles(out.turns);
+				if (missing.length)
+					notes.push(
+						`Critics flagged files they were not shown: ${missing.join(", ")}. Re-run with these ` +
+							"in `files` for a deeper review.",
+					);
+			}
 
 			const body = out.plan || out.transcript || "(no output)";
 			return {
@@ -396,8 +520,14 @@ export default function debateExtension(pi: ExtensionAPI): void {
 
 	// ponytail: /review-debate debaters are toolless and can only discuss the
 	// briefing they are handed — they cannot grep for a missed callsite, which is
-	// the defect class review most needs to catch. Upgrade path: give the critic a
-	// read-only scout subagent for that role only.
+	// the defect class review most needs to catch. Partly mitigated: critics are
+	// asked to emit a `NEEDED FILES:` trailer and the tool surfaces it as a note,
+	// so a second run can carry what the first was missing. Upgrade path, if that
+	// proves too weak: let a critic emit `NEED: <path>` and re-run its turn once
+	// with those files — realpath-resolved and confined to the repo root, dotfiles
+	// excluded, existing 64 KB/256 KB caps applied. A read-only scout subagent is
+	// NOT the upgrade path: the extension API exposes no spawn primitive (see
+	// docs/harness-notes.md item 6).
 	//
 	// Names are suffixed `-debate` because the interactive TUI owns a built-in
 	// `/plan` (the plan-mode toggle) that intercepts the name before extension
@@ -415,8 +545,18 @@ export default function debateExtension(pi: ExtensionAPI): void {
 						(focus
 							? `otherwise the following text IS the goal: ${focus}. `
 							: `if there is no prior request, ask me for one rather than inventing it. `) +
-						`Leave the \`debaters\` and \`ultrathink\` parameters unset — the tool asks me directly; ` +
-						`pass them only if I already specified them.`,
+						`Leave the \`debaters\`, \`ultrathink\` and \`interactive\` parameters unset — the tool ` +
+						`asks me directly; pass them only if I already specified them. ` +
+						(mode === "review"
+							? `Before you call it: grep for the callsites and usages of the code under review and ` +
+								`paste them into the briefing, because the debaters cannot look anything up. When it ` +
+								`returns, verify any file:line claim yourself before acting on it. `
+							: "") +
+						`When the tool returns, do not just tell me a plan exists — I cannot read a path. Write ` +
+						`the adjudicated plan verbatim to a markdown file OUTSIDE this repo (e.g. under ` +
+						`~/dev/docs/superpowers/specs/), never commit it, then run ` +
+						`\`plannotator annotate <path> --gate\` if that binary is on PATH so I can approve or ` +
+						`annotate it in the browser; if it is not, print the plan in full in your reply.`,
 				);
 			},
 		});

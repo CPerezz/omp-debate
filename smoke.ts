@@ -170,8 +170,9 @@ if (process.argv.includes("--live")) {
 	const message =
 		"/plan-debate Add a --dry-run flag to deploy.sh. Context for the briefing: bash script, ~50 lines, " +
 		"rsync then systemctl restart, no tests exist. Use rounds=1. Do not read any files; " +
-		"the briefing above is the whole context. When calling the debate tool pass debaters=2 and " +
-		"ultrathink=\"none\" so this unattended run never waits on the pre-flight dialog.";
+		"the briefing above is the whole context. When calling the debate tool pass debaters=2, " +
+		'ultrathink="none" so this unattended run never waits on the pre-flight dialog, and ' +
+		"interactive=true so the headless gate path is exercised too.";
 	const { frames, raw, timedOut } = await rpc(
 		[{ id: "p1", type: "prompt", message }],
 		(f) => f.type === "agent_end" && f.isTerminal !== false,
@@ -228,6 +229,15 @@ if (process.argv.includes("--live")) {
 			if (bodyText.includes("Debaters: 1 proposer(s) + 1 critic(s)"))
 				pass("live: notes state the resolved seating");
 			else fail("live: notes missing the resolved seating line");
+
+			// Interactive gates were requested on a surface with no dialogs. The
+			// contract is deny-and-notify: never stall, and say so in the notes.
+			if (bodyText.includes("no TUI to ask through"))
+				pass("live: interactive gates requested headlessly were skipped with a note");
+			else fail("live: headless interactive run did not report skipped gates");
+			if (!view.turns.some((t) => t.role === "user"))
+				pass("live: no user turn appeared without a dialog to produce one");
+			else fail("live: a user turn materialised in a headless run");
 
 			// Updates arrive at turn boundaries plus the 300 ms heartbeat, so a
 			// healthy three-turn debate clears this floor comfortably.

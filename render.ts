@@ -27,7 +27,7 @@ export interface RenderOpts {
 /** Strip ANSI so the fake helpers in the self-check measure like the real ones. */
 const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
 
-type Colour = "accent" | "error" | "success" | "warning";
+type Colour = "accent" | "error" | "success" | "warning" | "muted";
 
 /** Debaters get 70% of the width; the adjudicator's verdict is the artefact the
  *  user actually reads, so it spans everything but a thin margin. */
@@ -64,10 +64,12 @@ function bubbleWidthFor(role: Role, width: number): number {
 	return Math.max(MIN_BOX_WIDTH, Math.floor(width * SIDE_FRACTION));
 }
 
-/** Colour per speaker. Critics alternate so two of them are told apart at a glance. */
+/** Colour per speaker. Critics alternate so two of them are told apart at a
+ *  glance; the user is dimmed because an interjection is not a debate position. */
 function colourFor(role: Role, seat: number): Colour {
 	if (role === "proposer") return "accent";
 	if (role === "adjudicator") return "success";
+	if (role === "user") return "muted";
 	return seat % 2 === 1 ? "error" : "warning";
 }
 
@@ -153,14 +155,25 @@ function capAtBullet(lines: string[]): string[] {
 	return lines.slice(0, cut);
 }
 
-/** Body lines for one completed turn, honouring collapse/expand and failures. */
+/** Body lines for one completed turn, honouring collapse/expand and failures.
+ *  `full` is set for the adjudicator's verdict once the debate is final: the plan
+ *  is the artefact the user came for, so it is never left behind a toggle. */
 function bodyFor(
 	turn: DebateView["turns"][number],
 	innerWidth: number,
 	expanded: boolean,
 	h: RenderHelpers,
+	full = false,
 ): string[] {
-	if (expanded) return h.wrap(turn.text, innerWidth);
+	if (expanded || full) return h.wrap(turn.text, innerWidth);
+	// A user turn has no summary and needs none — it is short by construction — so
+	// it is shown verbatim, under the same height cap the summaries use.
+	if (turn.role === "user") {
+		const lines = h.wrap(turn.text, innerWidth);
+		return lines.length <= MAX_SUMMARY_LINES
+			? lines
+			: [...lines.slice(0, MAX_SUMMARY_LINES), `▸ ${turn.chars} chars — expand to read in full`];
+	}
 	if (turn.summary) {
 		const lines = capAtBullet(wrapBullets(turn.summary, innerWidth, h));
 		return [...lines, `▸ ${turn.chars} chars — expand to read in full`];
@@ -188,8 +201,14 @@ export function renderRows(
 		const rows: string[] = [];
 
 		for (const turn of turns) {
+			// The verdict is what the user came for: once the debate is final it is
+			// shown in full rather than as a ten-line summary behind a toggle.
+			const full = turn.role === "adjudicator" && !opts.isPartial;
+			// A user turn has no model to name, so the right slot names its targets.
+			const right =
+				turn.role === "user" ? (turn.to?.length ? `→ ${turn.to.join(", ")}` : "") : turn.modelId;
 			if (plain) {
-				for (const line of bodyFor(turn, width, opts.expanded, h)) {
+				for (const line of bodyFor(turn, width, opts.expanded, h, full)) {
 					const cut = h.truncate(line, width);
 					rows.push(cut + spaces(width - h.visibleWidth(cut)));
 				}
@@ -197,15 +216,15 @@ export function renderRows(
 			}
 			const colour = colourFor(turn.role, turn.seat);
 			if (!sides) {
-				const body = bodyFor(turn, width - 2, opts.expanded, h);
-				rows.push(...guttered(turn.label, turn.modelId, body, width, colour, theme, h));
+				const body = bodyFor(turn, width - 2, opts.expanded, h, full);
+				rows.push(...guttered(turn.label, right, body, width, colour, theme, h));
 				rows.push(spaces(width));
 				continue;
 			}
 			const bw = bubbleWidthFor(turn.role, width);
 			const off = offsetFor(turn.role, width, bw);
-			const body = bodyFor(turn, bw - 4, false, h);
-			for (const r of boxed(turn.label, turn.modelId, body, bw, colour, theme, h))
+			const body = bodyFor(turn, bw - 4, false, h, full);
+			for (const r of boxed(turn.label, right, body, bw, colour, theme, h))
 				rows.push(spaces(off) + r + spaces(width - off - h.visibleWidth(r)));
 			rows.push(spaces(width));
 		}
@@ -230,6 +249,18 @@ export function renderRows(
 				const line = spaces(Math.floor((inner - h.visibleWidth(dots)) / 2)) + dots;
 				rows.push(...guttered(label, spin, [line], width, colour, theme, h));
 			}
+		}
+
+		// Paused on a gate. Nothing is thinking, so the animation above is absent
+		// and this row says why — same shape as the abort note below.
+		if (view.gate && !view.current) {
+			const note =
+				view.gate.kind === "verdict"
+					? "⏸ verdict delivered — waiting for your input"
+					: `⏸ round ${view.gate.round} complete — waiting for your input`;
+			const cut = h.truncate(note, width);
+			const pad = Math.floor((width - h.visibleWidth(cut)) / 2);
+			rows.push(spaces(pad) + theme.fg("muted", cut) + spaces(width - pad - h.visibleWidth(cut)));
 		}
 
 		if (view.aborted || view.error) {
@@ -497,7 +528,110 @@ export async function demo(): Promise<void> {
 	const lastBody = bodyOnly[bodyOnly.length - 1] ?? "";
 	assert.ok(lastBody.length > 0 && !lastBody.endsWith("…"), "cap did not clip mid-sentence");
 
-	// 10. the Component wrapper re-renders at the host's width
+	// 10. a user turn: centred, dimmed, 70% wide, and it names its targets
+	const withUser: DebateView = {
+		...view,
+		turns: [
+			view.turns[0],
+			{
+				role: "user",
+				seat: 1,
+				label: "User",
+				text: "why not X? the retry budget is per-host, not global",
+				modelId: "",
+				to: ["Critic A", "Proposer"],
+				chars: 51,
+			},
+			view.turns[1],
+		],
+	};
+	for (const w of [72, 100, 140]) {
+		for (const row of renderRows(withUser, w, collapsed, theme, h))
+			assert.equal(h.visibleWidth(row), w, `user-turn row width at ${w}`);
+	}
+	const uRows = renderRows(withUser, 100, collapsed, theme, h);
+	const uHead = uRows.find((r) => stripAnsi(r).includes("User"));
+	assert.ok(uHead, "the user turn has a header row");
+	assert.equal(uHead.search(/\S/), Math.floor((100 - 70) / 2), "user bubble is centred");
+	assert.equal(stripAnsi(uHead).trim().endsWith("─╮"), true, "and closes its box");
+	assert.ok(stripAnsi(uHead).includes("→ Critic A, Proposer"), "the header names the targets");
+	const uBody = uRows
+		.filter((r) => r.includes("│") && stripAnsi(r).includes("retry budget"))
+		.map((r) => stripAnsi(r));
+	assert.equal(uBody.length, 1, "short user text renders verbatim on one line");
+	assert.ok(
+		!uRows.some((r) => stripAnsi(r).includes("(no summary)")),
+		"a user turn is not a turn whose summary failed",
+	);
+	const longUser: DebateView = {
+		...withUser,
+		turns: [{ ...withUser.turns[1], text: "word ".repeat(400).trim(), chars: 1999 }],
+	};
+	const luRows = renderRows(longUser, 100, collapsed, theme, h);
+	assert.ok(
+		luRows.some((r) => stripAnsi(r).includes("1999 chars — expand")),
+		"an overlong user turn is capped with the standard hint",
+	);
+	assert.ok(luRows.filter((r) => r.includes("│")).length <= MAX_SUMMARY_LINES + 1, "cap respected");
+
+	// 11. the verdict is rendered in full once the debate is final, and only then
+	const finalRows = renderRows(view, 100, collapsed, theme, h);
+	const partialRows = renderRows(view, 100, { expanded: false, isPartial: true }, theme, h);
+	assert.ok(
+		stripAnsi(finalRows.join(" ")).includes("A A A A"),
+		"a finished debate shows the whole verdict, not a summary behind a toggle",
+	);
+	assert.ok(
+		!stripAnsi(partialRows.join(" ")).includes("A A A A"),
+		"while the debate is still running the verdict stays summarised",
+	);
+	assert.ok(
+		stripAnsi(partialRows.join(" ")).includes("adopts rsync -n"),
+		"the running view shows the verdict summary",
+	);
+	for (const row of finalRows) assert.equal(h.visibleWidth(row), 100, "full-verdict row width");
+
+	// 12. a gate pauses the pane: one dimmed centred row, never alongside a
+	// thinking animation, and never a throw on a malformed gate
+	const paused: DebateView = { ...view, gate: { kind: "round", round: 2 } };
+	const pRows = renderRows(paused, 100, collapsed, theme, h);
+	assert.ok(
+		pRows.some((r) => stripAnsi(r).includes("⏸ round 2 complete — waiting for your input")),
+		"a round gate says which round it is waiting on",
+	);
+	for (const row of pRows) assert.equal(h.visibleWidth(row), 100, "paused row width");
+	const verdictPaused = renderRows(
+		{ ...view, gate: { kind: "verdict", round: 1 } },
+		100,
+		collapsed,
+		theme,
+		h,
+	);
+	assert.ok(
+		verdictPaused.some((r) => stripAnsi(r).includes("⏸ verdict delivered")),
+		"the verdict gate says the plan is already in hand",
+	);
+	const busy = renderRows(
+		{ ...paused, current: { role: "critic", seat: 1, label: "Critic" } },
+		100,
+		{ expanded: false, isPartial: true, spinnerFrame: 1 },
+		theme,
+		h,
+	);
+	assert.ok(
+		!busy.some((r) => stripAnsi(r).includes("waiting for your input")),
+		"a live speaker wins over a stale gate flag",
+	);
+	for (const w of [30, 60, 100]) {
+		const narrowPaused = renderRows(paused, w, collapsed, theme, h);
+		for (const row of narrowPaused) assert.equal(h.visibleWidth(row), w, `paused row width at ${w}`);
+	}
+	assert.doesNotThrow(
+		() => renderRows({ ...view, gate: {} as DebateView["gate"] }, 100, collapsed, theme, h),
+		"a malformed gate never breaks the frame",
+	);
+
+	// 13. the Component wrapper re-renders at the host's width
 	const comp = renderDebate(view, collapsed, theme, h);
 	assert.ok(comp.render(80).length > 0, "component renders");
 	for (const row of comp.render(80)) assert.equal(h.visibleWidth(row), 80, "component row width");
