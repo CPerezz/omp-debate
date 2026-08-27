@@ -146,8 +146,13 @@ export function makeTurnRunner(ctx: ExtensionContext, model: Model<Api>): TurnRu
 	};
 }
 
-const PREFLIGHT_TIMEOUT_S = 120;
-const CUSTOM_COUNT_TIMEOUT_S = 60;
+/** `ExtensionUIDialogOptions.timeout` is MILLISECONDS, though nothing in its type
+ *  says so (`CountdownTimer(timeoutMs)` in ask-dialog.ts). Passing seconds here
+ *  made every pre-flight dialog expire after 120 ms — before a human could read
+ *  it — and then answer itself with its recommended option, so "the tool asks you"
+ *  was never true. See docs/harness-notes.md items 7 and 9. */
+const PREFLIGHT_TIMEOUT_MS = 120_000;
+const CUSTOM_COUNT_TIMEOUT_MS = 60_000;
 
 const DEBATER_OPTIONS = [
 	{ label: "2 — proposer vs critic", description: "Cheapest: 3 model calls at rounds=1." },
@@ -217,9 +222,14 @@ async function resolvePreflight(
 			recommended: 0,
 		});
 
-	const answer = await ctx.ui.askDialog(questions, { signal, timeout: PREFLIGHT_TIMEOUT_S });
-	// `undefined` = cancelled or timed out; `kind: "chat"` = user redirected to chat.
+	const answer = await ctx.ui.askDialog(questions, { signal, timeout: PREFLIGHT_TIMEOUT_MS });
+	// `undefined` = cancelled; `kind: "chat"` = user redirected to chat.
 	if (!answer || answer.kind !== "submit") return fallback;
+	// A timeout does NOT resolve `undefined`: the host fills every unanswered
+	// question with its `recommended` option and submits with `timedOut: true`
+	// (`ask-dialog.ts`, `#handleTimeout`). Treat it as a cancel so the documented
+	// contract — a timeout runs the cheap defaults — is actually honoured.
+	if (answer.results.some((r) => r.timedOut)) return fallback;
 
 	const out: Preflight = { ...fallback, asked: true };
 	for (const item of answer.results) {
@@ -232,7 +242,7 @@ async function resolvePreflight(
 		const typed = picked.startsWith("Custom")
 			? await ctx.ui.input(`Debaters (${MIN_DEBATERS}–${MAX_DEBATERS})`, "4", {
 					signal,
-					timeout: CUSTOM_COUNT_TIMEOUT_S,
+					timeout: CUSTOM_COUNT_TIMEOUT_MS,
 				})
 			: picked;
 		const n = Number.parseInt(typed ?? "", 10);
