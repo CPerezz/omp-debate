@@ -1,6 +1,12 @@
 {
 	"name": "omp-debate",
-	"version": "1.0.0",
+	"version": "1.1.0",
+	"description": "omp extension: adversarial plan/review debates with chat-bubble rendering and smoke suite",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/CPerezz/omp-debate.git"
+	},
 	"type": "module",
 	"private": true,
 	"omp": { "extensions": ["./index.ts"] }

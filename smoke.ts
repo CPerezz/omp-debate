@@ -2,12 +2,12 @@
 // Tiered smoke suite for the debate extension.
 //
 //   bun smoke.ts          free: pure self-checks + host tool/command registration (~5 s, no tokens)
-//   bun smoke.ts --live   adds one real rounds:1 debate driven through /plan (2-5 min)
+//   bun smoke.ts --live   adds one real rounds:1 debate driven through /plan-debate (2-5 min)
 //
 // Plain-bun safe: imports only ./core.js and ./render.js (pure). The omp host is
 // exercised as a subprocess, never imported (pi-natives cannot load out-of-host).
 //
-// Why RPC and not `omp -p`: the /plan handler injects a steer via
+// Why RPC and not `omp -p`: the /plan-debate handler injects a steer via
 // pi.sendUserMessage, which starts a *new* agent run. Print mode considers its
 // own prompt resolved once the slash command is consumed, disposes the session,
 // and kills that run at the dispose deadline ("Active agent run still settling
@@ -143,7 +143,8 @@ for (const file of ["core.ts", "render.ts"]) {
 // ---- tier 1b: command registration ---------------------------------------
 // get_available_commands is first-wins across built-ins, skills, extensions and
 // file commands, so `source: "extension"` here also proves nothing shadows the
-// names — the failure mode that would silently swallow /plan.
+// names — the failure mode that silently swallowed the original `/plan`, which
+// the interactive TUI owns as its plan-mode toggle.
 {
 	const { frames, raw, timedOut } = await rpc(
 		[{ id: "c1", type: "get_available_commands" }],
@@ -153,7 +154,7 @@ for (const file of ["core.ts", "render.ts"]) {
 	const cmds = frames.find((f) => f.command === "get_available_commands")?.data?.commands ?? [];
 	if (timedOut || cmds.length === 0) fail(`command registration: no command list (timedOut=${timedOut}): ${raw.slice(-400)}`);
 	else {
-		for (const name of ["plan", "review"]) {
+		for (const name of ["plan-debate", "review-debate"]) {
 			const hits = cmds.filter((c) => c.name === name);
 			if (hits.length === 1 && hits[0].source === "extension" && hits[0].description?.includes("adversarial"))
 				pass(`command registration: /${name} owned by the extension`);
@@ -162,14 +163,15 @@ for (const file of ["core.ts", "render.ts"]) {
 	}
 }
 
-// ---- tier 2: one real debate through /plan (opt-in) -----------------------
+// ---- tier 2: one real debate through /plan-debate (opt-in) ----------------
 if (process.argv.includes("--live")) {
 	// Driving the slash command (not a "call the debate tool" instruction) covers
 	// the whole chain: command dispatch → injected steer → orchestrator → tool.
 	const message =
-		"/plan Add a --dry-run flag to deploy.sh. Context for the briefing: bash script, ~50 lines, " +
+		"/plan-debate Add a --dry-run flag to deploy.sh. Context for the briefing: bash script, ~50 lines, " +
 		"rsync then systemctl restart, no tests exist. Use rounds=1. Do not read any files; " +
-		"the briefing above is the whole context.";
+		"the briefing above is the whole context. When calling the debate tool pass debaters=2 and " +
+		"ultrathink=\"none\" so this unattended run never waits on the pre-flight dialog.";
 	const { frames, raw, timedOut } = await rpc(
 		[{ id: "p1", type: "prompt", message }],
 		(f) => f.type === "agent_end" && f.isTerminal !== false,
@@ -181,11 +183,12 @@ if (process.argv.includes("--live")) {
 	const ends = frames.filter((f) => f.type === "tool_execution_end" && f.toolName === "debate");
 	if (ends.length !== 1) {
 		fail(
-			`live: expected exactly 1 debate tool_execution_end, got ${ends.length} — /plan did not dispatch, ` +
+			`live: expected exactly 1 debate tool_execution_end, got ${ends.length} — /plan-debate did not ` +
+				`dispatch, ` +
 				`quota is exhausted, or the extension failed to load; frames: ${FRAME_DUMP}, raw tail: ${raw.slice(-400)}`,
 		);
 	} else {
-		pass("live: /plan dispatched and the debate tool executed");
+		pass("live: /plan-debate dispatched and the debate tool executed");
 		const end = ends[0];
 		const view = end.result?.details as DebateView | undefined;
 		const bodyText = end.result?.content?.[0]?.text ?? "";
@@ -203,6 +206,10 @@ if (process.argv.includes("--live")) {
 			if (roles === "proposer,critic,adjudicator") pass("live: turn order proposer→critic→adjudicator");
 			else fail(`live: wrong turn order: ${roles}`);
 
+			const labels = view.turns.map((t) => t.label).join(",");
+			if (labels === "Proposer,Critic,Adjudicator") pass("live: one seat per role, unsuffixed labels");
+			else fail(`live: wrong speaker labels: ${labels}`);
+
 			const ids = new Set(view.turns.map((t) => t.modelId));
 			if (ids.size === 1 && !ids.has("")) pass(`live: all roles on one model (${[...ids][0]})`);
 			else fail(`live: expected one shared model id, got [${[...ids].join("|")}]`);
@@ -218,6 +225,12 @@ if (process.argv.includes("--live")) {
 			if (bodyText.includes("All roles ran on")) pass("live: notes footer present");
 			else fail("live: notes footer missing from content");
 
+			if (bodyText.includes("Debaters: 1 proposer(s) + 1 critic(s)"))
+				pass("live: notes state the resolved seating");
+			else fail("live: notes missing the resolved seating line");
+
+			// Updates arrive at turn boundaries plus the 300 ms heartbeat, so a
+			// healthy three-turn debate clears this floor comfortably.
 			if (updates >= 6) pass(`live: progressive streaming observed (${updates} updates)`);
 			else fail(`live: only ${updates} update events — streaming path broken?`);
 
@@ -241,10 +254,28 @@ if (process.argv.includes("--live")) {
 				if (bad === 0 && rows.length > 0) pass(`live: renderRows uniform at width ${w} (${rows.length} rows)`);
 				else fail(`live: ${bad} rows off-width at ${w}`);
 			}
-			const joined = renderRows(view, 100, { expanded: false, isPartial: false }, th, h).join("\n");
+			const rows100 = renderRows(view, 100, { expanded: false, isPartial: false }, th, h);
+			const joined = rows100.join("\n");
 			if (["Proposer", "Critic", "Adjudicator"].every((n) => joined.includes(n)))
 				pass("live: all three role headers rendered");
 			else fail("live: missing role header in rendered output");
+
+			// Layout contract: the adjudicator's verdict spans everything but a
+			// 2-column margin; debaters stay at 70% so the sides read as a chat.
+			const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+			const adjHead = rows100.find((r) => strip(r).includes("Adjudicator") && strip(r).includes("╭"));
+			if (!adjHead) {
+				fail("live: no adjudicator bubble header at width 100");
+			} else {
+				const lead = strip(adjHead).search(/\S/);
+				const end = strip(adjHead).trimEnd().length;
+				if (lead === 2 && end >= 96) pass(`live: adjudicator spans cols ${lead}–${end} of 100`);
+				else fail(`live: adjudicator geometry wrong (lead=${lead}, end=${end})`);
+			}
+			const propHead = rows100.find((r) => strip(r).includes("Proposer") && strip(r).includes("╭"));
+			const propWidth = propHead ? strip(propHead).trimEnd().length : -1;
+			if (propWidth === 70) pass("live: proposer bubble is 70% of width");
+			else fail(`live: proposer bubble width ${propWidth}, expected 70`);
 		}
 	}
 	if (failures) console.log(`\nframes dumped to ${FRAME_DUMP}`);

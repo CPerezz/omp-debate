@@ -10,7 +10,7 @@
 import { strict as assert } from "node:assert";
 
 import type { Theme } from "@oh-my-pi/pi-coding-agent";
-import { LABEL, type DebateView, type Role } from "./core.js";
+import type { DebateView, Role } from "./core.js";
 
 export interface RenderHelpers {
 	visibleWidth(s: string): number;
@@ -27,14 +27,13 @@ export interface RenderOpts {
 /** Strip ANSI so the fake helpers in the self-check measure like the real ones. */
 const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, "");
 
-const COLOUR: Record<Role, "accent" | "error" | "success"> = {
-	proposer: "accent",
-	critic: "error",
-	adjudicator: "success",
-};
-const FRACTION: Record<Role, number> = { proposer: 0.6, critic: 0.6, adjudicator: 0.5 };
+type Colour = "accent" | "error" | "success" | "warning";
+
+/** Debaters get 70% of the width; the adjudicator's verdict is the artefact the
+ *  user actually reads, so it spans everything but a thin margin. */
+const SIDE_FRACTION = 0.7;
+const ADJ_MARGIN = 2;
 const MAX_SUMMARY_LINES = 10;
-const STREAM_TAIL_LINES = 6;
 const FALLBACK_HEAD_LINES = 6;
 const MIN_SIDES_WIDTH = 72;
 const MIN_BOX_WIDTH = 24;
@@ -43,6 +42,34 @@ const MIN_BOX_WIDTH = 24;
  *  when a truncation lands exactly on the boundary. Clamping in one place keeps
  *  a rounding slip from taking down the whole TUI frame. */
 const spaces = (n: number): string => " ".repeat(Math.max(0, n));
+
+/**
+ * Thinking animation: dots appear one by one, then disappear one by one.
+ *
+ * Exported as the test seam for the phase table — the host advances
+ * `spinnerFrame` on every repaint, so this is what makes the bubble look alive
+ * while a model is thinking and emitting nothing.
+ */
+const DOT_PHASES = ["•", "• •", "• • •", "• •", "•", ""];
+export function dotsFor(frame: number): string {
+	return DOT_PHASES[((frame % DOT_PHASES.length) + DOT_PHASES.length) % DOT_PHASES.length] ?? "";
+}
+
+/**
+ * Bubble width for a role. Shared by the completed-turn and streaming paths so a
+ * bubble cannot change width when its summary lands.
+ */
+function bubbleWidthFor(role: Role, width: number): number {
+	if (role === "adjudicator") return Math.max(MIN_BOX_WIDTH, width - 2 * ADJ_MARGIN);
+	return Math.max(MIN_BOX_WIDTH, Math.floor(width * SIDE_FRACTION));
+}
+
+/** Colour per speaker. Critics alternate so two of them are told apart at a glance. */
+function colourFor(role: Role, seat: number): Colour {
+	if (role === "proposer") return "accent";
+	if (role === "adjudicator") return "success";
+	return seat % 2 === 1 ? "error" : "warning";
+}
 
 /** Left edge of a role's bubble. */
 function offsetFor(role: Role, width: number, bubbleWidth: number): number {
@@ -58,7 +85,7 @@ function boxed(
 	right: string,
 	body: string[],
 	bubbleWidth: number,
-	colour: "accent" | "error" | "success",
+	colour: Colour,
 	theme: Theme,
 	h: RenderHelpers,
 ): string[] {
@@ -80,7 +107,7 @@ function guttered(
 	right: string,
 	body: string[],
 	width: number,
-	colour: "accent" | "error" | "success",
+	colour: Colour,
 	theme: Theme,
 	h: RenderHelpers,
 ): string[] {
@@ -168,32 +195,40 @@ export function renderRows(
 				}
 				continue;
 			}
+			const colour = colourFor(turn.role, turn.seat);
 			if (!sides) {
 				const body = bodyFor(turn, width - 2, opts.expanded, h);
-				rows.push(...guttered(LABEL[turn.role], turn.modelId, body, width, COLOUR[turn.role], theme, h));
+				rows.push(...guttered(turn.label, turn.modelId, body, width, colour, theme, h));
 				rows.push(spaces(width));
 				continue;
 			}
-			const bw = Math.floor(width * FRACTION[turn.role]);
+			const bw = bubbleWidthFor(turn.role, width);
 			const off = offsetFor(turn.role, width, bw);
 			const body = bodyFor(turn, bw - 4, false, h);
-			for (const r of boxed(LABEL[turn.role], turn.modelId, body, bw, COLOUR[turn.role], theme, h))
+			for (const r of boxed(turn.label, turn.modelId, body, bw, colour, theme, h))
 				rows.push(spaces(off) + r + spaces(width - off - h.visibleWidth(r)));
 			rows.push(spaces(width));
 		}
 
 		if (view.current && !plain) {
-			const role = view.current.role;
+			// No text: a turn in flight is a header plus the thinking animation. The
+			// streamed body used to be shown here and was unreadable at this speed.
+			const { role, seat, label } = view.current;
+			const colour = colourFor(role, seat);
 			const frames = theme.spinnerFrames;
 			const spin = frames[(opts.spinnerFrame ?? 0) % frames.length] ?? "";
-			const bw = sides ? Math.floor(width * FRACTION[role]) : width;
-			const tail = h.wrap(view.current.tail, sides ? bw - 4 : width - 2).slice(-STREAM_TAIL_LINES);
+			const dots = dotsFor(opts.spinnerFrame ?? 0);
 			if (sides) {
+				const bw = bubbleWidthFor(role, width);
 				const off = offsetFor(role, width, bw);
-				for (const r of boxed(LABEL[role], spin, tail, bw, COLOUR[role], theme, h))
+				const inner = bw - 4;
+				const line = spaces(Math.floor((inner - h.visibleWidth(dots)) / 2)) + dots;
+				for (const r of boxed(label, spin, [line], bw, colour, theme, h))
 					rows.push(spaces(off) + r + spaces(width - off - h.visibleWidth(r)));
 			} else {
-				rows.push(...guttered(LABEL[role], spin, tail, width, COLOUR[role], theme, h));
+				const inner = width - 2;
+				const line = spaces(Math.floor((inner - h.visibleWidth(dots)) / 2)) + dots;
+				rows.push(...guttered(label, spin, [line], width, colour, theme, h));
 			}
 		}
 
@@ -274,6 +309,8 @@ export async function demo(): Promise<void> {
 		turns: [
 			{
 				role: "proposer",
+				seat: 1,
+				label: "Proposer",
 				text: "P ".repeat(400).trim(),
 				summary: "proposes a flag\nvalidated early",
 				modelId: "claude-fable-5",
@@ -281,6 +318,8 @@ export async function demo(): Promise<void> {
 			},
 			{
 				role: "critic",
+				seat: 1,
+				label: "Critic",
 				text: "C ".repeat(300).trim(),
 				summary: "still pressing set -e\nconceded systemctl",
 				modelId: "claude-fable-5",
@@ -288,6 +327,8 @@ export async function demo(): Promise<void> {
 			},
 			{
 				role: "adjudicator",
+				seat: 1,
+				label: "Adjudicator",
 				text: "A ".repeat(200).trim(),
 				summary: "adopts rsync -n",
 				modelId: "claude-fable-5",
@@ -303,17 +344,21 @@ export async function demo(): Promise<void> {
 			assert.equal(h.visibleWidth(row), w, `row width at ${w}`);
 	}
 
-	// 2. side placement: proposer flush left, critic right-aligned, adjudicator centred
+	// 2. geometry: debaters take 70% and hug their side; the adjudicator spans
+	// everything but a 2-column margin
 	const rows = renderRows(view, 100, collapsed, theme, h);
 	const pRow = rows.find((r) => r.includes("Proposer"));
 	const cRow = rows.find((r) => r.includes("Critic"));
 	const aRow = rows.find((r) => r.includes("Adjudicator"));
 	assert.ok(pRow && cRow && aRow, "a header row exists for each role");
+	const side = Math.floor(100 * 0.7);
+	assert.equal(side, 70, "70% of 100 columns");
 	assert.equal(pRow.search(/\S/), 0, "proposer flush left");
+	assert.equal(stripAnsi(pRow).trimEnd().length, side, "proposer bubble is 70% wide");
 	assert.equal(stripAnsi(cRow).trimEnd().length, 100, "critic right edge at width");
-	const aLeft = aRow.search(/\S/);
-	const aRight = 100 - stripAnsi(aRow).trimEnd().length;
-	assert.ok(Math.abs(aLeft - aRight) <= 1, "adjudicator centred within one column");
+	assert.equal(cRow.search(/\S/), 100 - side, "critic bubble is 70% wide, right-aligned");
+	assert.equal(aRow.search(/\S/), 2, "adjudicator starts at the 2-column margin");
+	assert.equal(stripAnsi(aRow).trimEnd().length, 98, "adjudicator ends at the 2-column margin");
 
 	// 3. collapsed caps content lines; expanded carries the full text
 	const bodyLines = rows.filter((r) => r.includes("│")).length;
@@ -329,22 +374,59 @@ export async function demo(): Promise<void> {
 		"no side offsets below 72 columns",
 	);
 
-	// 5. headers name the role and the model
+	// 5. headers name the speaker and the model
 	assert.ok(
 		stripAnsi(pRow).includes("Proposer") && stripAnsi(pRow).includes("claude-fable-5"),
 		"header content",
 	);
 
-	// 6. streaming shows a tail and a spinner, no summary
+	// 6. a turn in flight renders a header + one animated line, and NO text
 	const live: DebateView = {
 		...view,
-		turns: view.turns.slice(0, 1),
-		current: { role: "critic", tail: "x ".repeat(200).trim() },
+		turns: [],
+		current: { role: "critic", seat: 1, label: "Critic" },
 	};
-	const liveRows = renderRows(live, 100, { expanded: false, isPartial: true, spinnerFrame: 1 }, theme, h);
+	const liveRows = renderRows(live, 100, { expanded: false, isPartial: true, spinnerFrame: 2 }, theme, h);
+	assert.equal(liveRows.length, 3, "streaming bubble is head + dots + foot");
 	for (const row of liveRows) assert.equal(h.visibleWidth(row), 100, "streaming row width");
-	assert.ok(stripAnsi(liveRows.join("\n")).includes("/"), "spinner frame rendered");
-	assert.ok(stripAnsi(liveRows.join("\n")).includes("x x"), "live tail rendered");
+	assert.ok(stripAnsi(liveRows[0]).includes("Critic"), "streaming header names the speaker");
+	assert.ok(stripAnsi(liveRows[0]).includes("-"), "spinner frame 2 rendered in the header");
+	assert.equal(
+		stripAnsi(liveRows[1]).replace(/[│╭╮╰╯─]/g, "").trim(),
+		"• • •",
+		"frame 2 shows all three dots and nothing else",
+	);
+
+	// 6b. the animation cycles up and back down, and never breaks row width
+	assert.deepEqual(
+		[0, 1, 2, 3, 4, 5].map(dotsFor),
+		["•", "• •", "• • •", "• •", "•", ""],
+		"dots appear then disappear one by one",
+	);
+	assert.equal(dotsFor(6), "•", "cycle wraps");
+	assert.equal(dotsFor(-1), "", "negative frames stay in range");
+	for (const frame of [0, 1, 2, 3, 4, 5]) {
+		const phaseRows = renderRows(live, 100, { expanded: false, isPartial: true, spinnerFrame: frame }, theme, h);
+		assert.equal(phaseRows.length, 3, `phase ${frame} keeps the bubble 3 rows tall`);
+		for (const row of phaseRows) assert.equal(h.visibleWidth(row), 100, `phase ${frame} row width`);
+	}
+
+	// 6c. a streaming turn never leaks the previous turns' body text into its box
+	const liveAfter: DebateView = { ...view, current: { role: "proposer", seat: 2, label: "Proposer B" } };
+	const afterRows = renderRows(liveAfter, 100, { expanded: false, isPartial: true, spinnerFrame: 0 }, theme, h);
+	const streamHead = afterRows.findIndex((r) => stripAnsi(r).includes("Proposer B"));
+	assert.ok(streamHead >= 0, "streaming bubble present after completed turns");
+	assert.equal(afterRows.length - streamHead, 3, "streaming bubble is the last 3 rows");
+	assert.equal(afterRows[streamHead].search(/\S/), 0, "second proposer is still flush left");
+
+	// 6d. a second critic renders (a different colour, same geometry)
+	const twoCritics: DebateView = {
+		...view,
+		turns: [{ ...view.turns[1], seat: 2, label: "Critic B" }],
+	};
+	const twoRows = renderRows(twoCritics, 100, collapsed, theme, h);
+	for (const row of twoRows) assert.equal(h.visibleWidth(row), 100, "critic B row width");
+	assert.ok(stripAnsi(twoRows.join("\n")).includes("Critic B"), "critic B header rendered");
 
 	// 7. a failed summary falls back to head lines with a marker
 	const failed: DebateView = {
@@ -352,6 +434,8 @@ export async function demo(): Promise<void> {
 		turns: [
 			{
 				role: "proposer",
+				seat: 1,
+				label: "Proposer",
 				text: "line one\nline two\nline three",
 				summaryFailed: true,
 				modelId: "m",
@@ -385,6 +469,8 @@ export async function demo(): Promise<void> {
 		turns: [
 			{
 				role: "proposer",
+				seat: 1,
+				label: "Proposer",
 				text: "full",
 				modelId: "m",
 				chars: 4,
