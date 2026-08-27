@@ -9,5 +9,10 @@
 	},
 	"type": "module",
 	"private": true,
+	"scripts": {
+		"shots:done": "freeze --execute \"bun shots.ts done\" -o docs/debate.png --theme dracula --padding 12 --font.family Menlo",
+		"shots:streaming": "freeze --execute \"bun shots.ts streaming\" -o docs/debate-streaming.png --theme dracula --padding 12 --font.family Menlo",
+		"shots": "bun run shots:done && bun run shots:streaming"
+	},
 	"omp": { "extensions": ["./index.ts"] }
 }

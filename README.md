@@ -110,11 +110,10 @@ Regenerate the screenshots after a layout change:
 
 ```bash
 brew install charmbracelet/tap/freeze
-freeze --execute "bun shots.ts done"      -o docs/debate.png           --theme dracula --padding 12 --font.family Menlo
-freeze --execute "bun shots.ts streaming" -o docs/debate-streaming.png --theme dracula --padding 12 --font.family Menlo
+bun run shots
 ```
 
-An explicit monospace `--font.family` is required: freeze's fallback font renders box-drawing characters at a different advance width and the bubbles visibly break.
+Always regenerate via `bun run shots`; never invoke `freeze` directly. The scripts in `package.json` pass an explicit monospace `--font.family` because freeze's fallback font renders box-drawing characters at a different advance width and the bubbles visibly break. Do not run `bun install` in this repo — a local `node_modules` shadows the host's module graph and breaks extension loading.
 
 [`docs/harness-notes.md`](docs/harness-notes.md) records the extension-API gaps this extension ran into, with evidence and proposed fixes.
 
